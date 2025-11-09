@@ -1,0 +1,3 @@
+https://www.seismicportal.eu/standing_order
+wss://www.seismicportal.eu/standing_order/websocket
+https://www.seismicportal.eu/mtws/api/search?format=json&limit=1
