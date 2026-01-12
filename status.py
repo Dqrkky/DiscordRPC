@@ -1,38 +1,39 @@
 import requests
 import time
+import asyncio
 import uptime_kuma_api
 import dotenv
 import json
 import DiscordRPC
+import status_queue
 
+rpc = status_queue.Rpc()
 credentials = dotenv.dotenv_values(
     dotenv_path=".env"
 )
 rp = DiscordRPC.client.DiscordRPCClient(auto_discover=True)
 
-def change_status(details=None, state=None):
-    print(json.dumps(
-        obj=rp.update(
-            data={
-                **({"details": details} if details else {}),
-                "state": state,
-            }
-        ),
-        indent=4
-    ))
+async def change_status(details=None, state=None):
+    """Push status updates into the Rpc queue instead of sending directly."""
+    payload = {
+        "details": details,
+        "state": state,
+    }
+    rpc.write(item=json.dumps(obj=payload))
 
 last_seismic_time = 0  # Timestamp of last test
-def check_seismic_events(rss :requests.Session):
+async def check_seismic_events(rss :requests.Session):
     global last_seismic_time
     now = time.time()
+    time_until = 60 * 30
     elapsed = now - last_seismic_time
-    if elapsed < 3600:
-        remaining_minutes = (3600 - elapsed) / 60
-        change_status(
+    if elapsed < time_until:
+        remaining_minutes = (time_until - elapsed) / 60
+        await change_status(
             details="[SeismicPortal.eu]: Error",
             state=f'Ran ({elapsed / 60:.2f} minutes ago) will re-run (in {remaining_minutes:.2f} minutes)'
         )
-        time.sleep(wait_time)
+        await asyncio.sleep(wait_time)
         return
     last_seismic_time = now  # Update the last run time
     try:
@@ -63,19 +64,16 @@ def check_seismic_events(rss :requests.Session):
         time_str = data.get("time", "").split("T")[1].split(".")[0]
         lastupdate_str = data.get("lastupdate", "").split("T")[1].split(".")[0]
         quake_msg = f"[🌍 Quake {source_catalog}]: M{mag} D{depth} {place} (at {time_str}) (lastupdate {lastupdate_str}) UTC"
-        change_status(
+        await change_status(
             details="[SeismicPortal.eu]",
             state=quake_msg
         )
-        time.sleep(wait_time)
-        return
     except Exception as e:
-        change_status(
+        await change_status(
             details="[SeismicPortal.eu]",
             state=f"Ops ... Something happened (ErrorType: {type(e).__name__}) re-trying (in {wait_time} seconds) :/"
         )
-        time.sleep(wait_time)
-        return
+    await asyncio.sleep(wait_time)
 
 def getstatus(api :uptime_kuma_api.UptimeKumaApi, monitor :dict[str, str]):
     try:
@@ -90,10 +88,10 @@ def printJs0n(js0n :dict=None):
         indent=4
     ))
 
-def new_check_for_updates():
+async def new_check_for_updates():
     try:
         with uptime_kuma_api.UptimeKumaApi(
-            url="http://192.168.31.101:3001",
+            url="http://undentified.ddns.net:84",
             timeout=60,
             ssl_verify=False
         ) as api:
@@ -103,11 +101,11 @@ def new_check_for_updates():
             )
             status_pages = [api.get_status_page(slug=status_page["slug"]) for status_page in api.get_status_pages()]
     except Exception as e:
-        change_status(
+        await change_status(
             details="[UpTimeKuma.org 🤍]",
             state=f"""Ops ... Something happened (ErrorType: {type(e).__name__}) re-trying (in {wait_time} seconds) :/""",
         )
-        time.sleep(wait_time)
+        await asyncio.sleep(wait_time)
         return
     messages = [
         {
@@ -120,18 +118,27 @@ def new_check_for_updates():
         for status in [getstatus(api=api, monitor=monitor)]
     ]
     for message in messages:
-        change_status(
+        await change_status(
             details=message["details"],
             state=message["state"]
         )
-        time.sleep(15)
-    time.sleep(wait_time-15)
+        await asyncio.sleep(15)
+    await asyncio.sleep(wait_time - 15)
 
-wait_time = 60
-debug = False  # Set to False to disable debug mode
-# Run the RSS listener every 60 seconds
-if __name__ == "__main__":  # noqa: E712
-    print("📡 Listening for UptimeRobot RSS feed updates...")
+async def worker():
+    """Continuously read from Rpc queue and send to localhost update endpoint."""
+    while True:
+        if not rpc.is_empty():
+            item = rpc.read()
+            try:
+                print(rp.update(data=json.loads(s=item)))
+            except Exception as e:
+                print(f"Failed to send update: {e}")
+        await asyncio.sleep(1)
+
+
+async def main():
+    print("📡 Listening for updates...")
     with requests.Session() as rss:
         rss.headers.update(
             {
@@ -148,16 +155,25 @@ if __name__ == "__main__":  # noqa: E712
             }
         )
         if debug == True:  # noqa: E712
-            change_status(
+            await change_status(
                 details="(Not always) Afk",
                 state="Updating Rpc :/",
             )
         while debug == False:  # noqa: E712
             # check seismic first
-            check_seismic_events(rss)
-            new_check_for_updates()
-            change_status(
+            await check_seismic_events(rss)
+            await new_check_for_updates()
+            await change_status(
                 details="(Not always) Afk",
                 state=f"Waiting for next check (in {wait_time} seconds) :/",
             )
-            time.sleep(wait_time)
+            await asyncio.sleep(wait_time)
+
+
+wait_time = 60
+debug = False  # Set to False to disable debug mode
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(worker())
+    loop.run_until_complete(main())
